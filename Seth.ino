@@ -1,7 +1,8 @@
+#include <avr/eeprom.h>
+#include <ctype.h>
 #include <SoftwareSerial.h>
 #include <TinyGPS++.h>
 
-#define ID 1
 #define APN "internet"
 #define ARDUINO_RESET_PIN 7
 #define SIM800_RESET_PIN 8
@@ -14,16 +15,26 @@ char latSign, lngSign;
 uint16_t latDeg, lngDeg;
 uint32_t latFrac, lngFrac;
 uint32_t date, time, speed, course, altitude, satellites, hdop;
-uint32_t age, last;
+uint32_t age, lastUpload, lastSMSCheck;
 char gsmSerialBuffer[256];
 uint8_t failureCount;
 
+uint16_t deviceId;
+uint16_t EEMEM deviceId_E;
+
+uint32_t interval;
+uint16_t EEMEM interval_E;
+
+char apn[25];
+char EEMEM apn_E[25];
+
 void gpsUpdateValues();
 uint8_t gsmInit();
-uint8_t gsmSetup(const char* apn);
+uint8_t gsmSetup();
+uint8_t gsmSendSMS(const char* destination, const char* text);
 void gsmProcessSMS(uint16_t id, const char* sender, const char* text);
 void gsmCheckSMS();
-int16_t gsmGetSignalQuality();
+int8_t gsmGetSignalQuality();
 void gsmGetBatteryLevel(uint8_t* percentage, uint16_t* voltage);
 uint8_t gsmSendGETRequest(const char* url);
 uint8_t gsmSendPOSTRequest(const char* url, const char* params);
@@ -32,8 +43,9 @@ uint8_t gsmSendCommand(const char* cmd, uint16_t timeout = 5000, const char* exp
 uint8_t gsmSendCommand_P(const __FlashStringHelper* cmd, uint16_t timeout = 5000, const char* expected = 0);
 void reboot();
 
-const char format_0[] PROGMEM = "id=%d&lat=%c%u.%lu&lng=%c%u.%lu&date=%lu&time=%lu&speed=%lu&course=%lu&alt=%lu&sat=%lu&hdop=%lu&age=%lu&charge=%d&voltage=%u&signal=%d";
-const char format_1[] PROGMEM = "id=%d&charge=%d&voltage=%u&signal=%d";
+const char format_0[] PROGMEM = "id=%u&lat=%c%u.%lu&lng=%c%u.%lu&date=%lu&time=%lu&speed=%lu&course=%lu&alt=%lu&sat=%lu&hdop=%lu&age=%lu&charge=%d&voltage=%u&signal=%d";
+const char format_1[] PROGMEM = "id=%u&charge=%d&voltage=%u&signal=%d";
+const char format_2[] PROGMEM = "maps.google.com/maps?q=loc:%c%u.%lu,%c%u.%lu id=%u dt=%lu tm=%lu alt=%lu sat=%lu hdop=%lu age=%lu chg=%d vtg=%u sig=%d";
 
 void gpsUpdateValues() {
   if (gps.location.isUpdated()) {
@@ -87,19 +99,23 @@ uint8_t gsmInit() {
   if (!gsmSendCommand_P(F("AT"))) {
     return 1;
   }
-  
+
   if (!gsmSendCommand_P(F("AT+IPR=9600"))) {
     return 2;
   }
-  
-  if (!gsmSendCommand_P(F("AT+CFUN=1"))) {
+
+  if (!gsmSendCommand_P(F("ATE0"))) {
     return 3;
+  }
+
+  if (!gsmSendCommand_P(F("AT+CFUN=1"))) {
+    return 4;
   }
 
   return 0;
 }
 
-uint8_t gsmSetup(const char* apn) {
+uint8_t gsmSetup() {
   bool success = false;
 
   for (uint8_t n = 0; n < 30; n++) {
@@ -123,12 +139,26 @@ uint8_t gsmSetup(const char* apn) {
     return 1;
   }
 
-  if (!gsmSendCommand_P(F("AT+CGATT?"))) {
+  if (!gsmSendCommand_P(F("AT+CMGF=1"))) {
     return 2;
   }
 
-  if (!gsmSendCommand_P(F("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\""))) {
+  if (!gsmSendCommand_P(F("AT+CPMS=\"SM\",\"SM\",\"SM\""))) {
     return 3;
+  }
+
+  gsmCheckSMS();
+
+  eeprom_read_block((void*)&apn, (const void*)&apn_E, sizeof(apn) - 1);
+  Serial.print(F("Using APN: "));
+  Serial.println(apn);
+
+  if (!gsmSendCommand_P(F("AT+CGATT?"))) {
+    return 4;
+  }
+
+  if (!gsmSendCommand_P(F("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\""))) {
+    return 5;
   }
 
   gsmSerial.listen();
@@ -137,34 +167,147 @@ uint8_t gsmSetup(const char* apn) {
   gsmSerial.println(F("\""));
 
   if (!gsmSendCommand(0)) {
-    return 4;
-  }
-
-  if (!gsmSendCommand_P(F("ATS0=1"))) {
-    return 5;
-  }
-
-  if (!gsmSendCommand_P(F("AT+CMGF=1"))) {
     return 6;
   }
 
-  if (!gsmSendCommand_P(F("AT+CPMS=\"SM\",\"SM\",\"SM\""))) {
+  if (!gsmSendCommand_P(F("ATS0=1"))) {
     return 7;
   }
 
   return 0;
 }
 
-void gsmProcessSMS(uint16_t id, const char* sender, const char* text) {
+uint8_t gsmSendSMS(const char* destination, const char* text) {
+  gsmSerial.listen();
+  gsmSerial.print(F("AT+CMGS=\""));
+  gsmSerial.print(destination);
+  gsmSerial.println(F("\""));
+
+  if (!gsmSendCommand(0, 2000, ">")) {
+    return 1;
+  }
+
+  gsmSerial.print(text);
+  gsmSerial.write(0x1A);
+  gsmSerial.write(0x0D);
+  gsmSerial.write(0x0A);
+
+  if (!gsmSendCommand(0)) {
+    return 2;
+  }
+}
+
+void gsmProcessSMS(uint16_t id, const char* sender, char* text) {
   Serial.println(id);
   Serial.println(sender);
   Serial.println(text);
 
-  if (strcmp(text, "reboot") == 0) reboot();
-
   char buffer[12];
   sprintf(buffer, "AT+CMGD=%u", id);
   gsmSendCommand(buffer);
+
+  for (uint8_t i = 0; text[i]; ++i) {
+    text[i] = tolower(text[i]);
+  }
+
+  if (strncmp_P(text, PSTR("reboot"), 6) == 0) {
+    gsmSendSMS(sender, "OK");
+    reboot();
+  }
+
+  if ((strncmp_P(text, PSTR("id"), 2) == 0) && (strlen(text) > 3)) {
+    char param[5];
+    memset(param, 0, sizeof(param));
+
+    uint8_t i = 0;
+    text += 3;
+
+    while (*text) {
+      param[i++] = *text++;
+      if (i >= sizeof(param) - 1) break;
+    }
+
+    uint16_t deviceId_T = atoi(param);
+
+    if (deviceId_T > 0) {
+      eeprom_write_word(&deviceId_E, deviceId_T);
+      deviceId = deviceId_T;
+      
+      char reply[10];
+      sprintf_P(reply, PSTR("Device ID: %u"), deviceId);
+      gsmSendSMS(sender, reply);
+
+      Serial.print(F("Device ID updated: "));
+      Serial.println(deviceId);
+    }
+  }
+
+  if ((strncmp_P(text, PSTR("interval"), 8) == 0) && (strlen(text) > 9)) {
+    char param[5];
+    memset(param, 0, sizeof(param));
+
+    uint8_t i = 0;
+    text += 9;
+
+    while (*text) {
+      param[i++] = *text++;
+      if (i >= sizeof(param) - 1) break;
+    }
+
+    uint16_t interval_T = atoi(param);
+
+    if (interval_T > 0) {
+      eeprom_write_word(&interval_E, interval_T);
+      interval = interval_T * 1000;
+      
+      char reply[25];
+      sprintf_P(reply, PSTR("Interval: %lu ms"), interval);
+      gsmSendSMS(sender, reply);
+
+      Serial.print(F("Interval updated: "));
+      Serial.println(interval);
+    }
+  }
+
+  if ((strncmp_P(text, PSTR("apn"), 3) == 0) && (strlen(text) > 4)) {
+    char param[25];
+    memset(param, 0, sizeof(param));
+
+    uint8_t i = 0;
+    text += 4;
+
+    while (*text) {
+      param[i++] = *text++;
+      if (i >= sizeof(param) - 1) break;
+    }
+
+    if (strlen(param) > 0) {
+      eeprom_write_block((const void*)&param, (void*)&apn_E, sizeof(apn) - 1);
+      memcpy(apn, param, sizeof(apn));
+
+      char reply[30];
+      sprintf_P(reply, PSTR("APN: %s"), apn);
+      gsmSendSMS(sender, reply);
+
+      Serial.print(F("APN updated: "));
+      Serial.println(apn);
+    }
+  }
+
+  if (strncmp_P(text, PSTR("location"), 8) == 0) {
+    uint8_t batteryPercentage;
+    uint16_t batteryVoltage;
+    gsmGetBatteryLevel(&batteryPercentage, &batteryVoltage);
+    
+    int8_t signalStrength = gsmGetSignalQuality();
+    
+    char reply[161];
+    sprintf_P(reply, format_2, latSign, latDeg, latFrac, lngSign, lngDeg, lngFrac, deviceId, date, time, altitude, satellites, hdop, age, batteryPercentage, batteryVoltage, signalStrength);
+    gsmSendSMS(sender, reply);
+
+    Serial.print(F("Location query: "));
+    Serial.println(reply);
+  }
 }
 
 void gsmCheckSMS() {
@@ -185,6 +328,7 @@ void gsmCheckSMS() {
 
     while (*p != ',') {
       index[i++] = *p++;
+      if (i >= sizeof(index)) break;
     }
 
     while (*p != '"') ++p; ++p;
@@ -196,6 +340,7 @@ void gsmCheckSMS() {
 
     while (*p != '"') {
       sender[i++] = *p++;
+      if (i >= sizeof(sender)) break;
     }
 
     while (*p != '\n') ++p; ++p;
@@ -205,6 +350,7 @@ void gsmCheckSMS() {
 
     while (*p != '\r') {
       text[i++] = *p++;
+      if (i >= sizeof(text)) break;
     }
 
     uint16_t id = atoi(index);
@@ -214,23 +360,30 @@ void gsmCheckSMS() {
   };
 }
 
-int16_t gsmGetSignalQuality() {
+int8_t gsmGetSignalQuality() {
   gsmSendCommand_P(F("AT+CSQ"));
+
+  Serial.print(F("gsmSerialBuffer: "));
+  Serial.println(gsmSerialBuffer);
 
   char* p = strstr(gsmSerialBuffer, "CSQ: ");
 
   if (p) {
     p += 5;
     uint8_t i = 0;
-    char buffer[3];
+    char buffer[4];
 
     while (*p != ',') {
       buffer[i++] = *(p++);
+      if (i >= sizeof(buffer)) break;
     }
 
     int n = atoi(buffer);
-    if (n == 99 || n == -1) return 0;
-    return n * 2 - 114;
+
+    Serial.print(F("CSQ ATOI: "));
+    Serial.println(n);
+    
+    return n;
   }
 
   return 0;
@@ -416,7 +569,17 @@ void reboot() {
 void setup() {
   digitalWrite(ARDUINO_RESET_PIN, HIGH);
   pinMode(ARDUINO_RESET_PIN, OUTPUT);
-  
+
+  Serial.println(F("Bekti Tracker 0.1.0"));
+
+  deviceId = eeprom_read_word(&deviceId_E);
+  Serial.print(F("Device ID: "));
+  Serial.println(deviceId);
+
+  interval = eeprom_read_word(&interval_E) * 1000;
+  Serial.print(F("Update interval: "));
+  Serial.println(interval);
+
   Serial.begin(9600);
   gpsSerial.begin(9600);
   gsmSerial.begin(9600);
@@ -424,25 +587,25 @@ void setup() {
   for (;;) {
     Serial.println(F("Initializing GSM... "));
     uint8_t ret = gsmInit();
-    
+
     if (ret == 0) {
       Serial.println(F("OK"));
       break;
     }
-    
+
     Serial.print(F("Error code: "));
     Serial.println(ret);
   }
 
   for (;;) {
     Serial.println(F("Setting up network... "));
-    uint8_t ret = gsmSetup(APN);
-    
+    uint8_t ret = gsmSetup();
+
     if (ret == 0) {
       Serial.println(F("OK"));
       break;
     }
-    
+
     Serial.print(F("Error code: "));
     Serial.println(ret);
   }
@@ -456,21 +619,28 @@ void loop() {
     gpsUpdateValues();
   }
 
-  if (millis() - last > 10000) {
-    Serial.println(F("Interval"));
+  if (millis() - lastSMSCheck > 5000) {
+    Serial.print(F("Check SMS"));
+    gsmCheckSMS();
+    lastSMSCheck = millis();
+  }
+
+  if (millis() - lastUpload > interval) {
+    Serial.print(F("Interval "));
+    Serial.println(interval);
 
     gsmCheckSMS();
 
     uint8_t batteryPercentage;
     uint16_t batteryVoltage;
     gsmGetBatteryLevel(&batteryPercentage, &batteryVoltage);
-    int16_t signalStrength = gsmGetSignalQuality();
+    int8_t signalStrength = gsmGetSignalQuality();
     char paramsBuffer[200];
 
     if (gps.location.isValid()) {
-      sprintf_P(paramsBuffer, format_0, ID, latSign, latDeg, latFrac, lngSign, lngDeg, lngFrac, date, time, speed, course, altitude, satellites, hdop, age, batteryPercentage, batteryVoltage, signalStrength);
+      sprintf_P(paramsBuffer, format_0, deviceId, latSign, latDeg, latFrac, lngSign, lngDeg, lngFrac, date, time, speed, course, altitude, satellites, hdop, age, batteryPercentage, batteryVoltage, signalStrength);
     } else {
-      sprintf_P(paramsBuffer, format_1, ID, batteryPercentage, batteryVoltage, signalStrength);
+      sprintf_P(paramsBuffer, format_1, deviceId, batteryPercentage, batteryVoltage, signalStrength);
     }
 
     uint8_t ret = gsmSendPOSTRequest("seth.bekti.io/api/v1/location", paramsBuffer);
@@ -485,6 +655,6 @@ void loop() {
       reboot();
     }
 
-    last = millis();
+    lastUpload = millis();
   }
 }
