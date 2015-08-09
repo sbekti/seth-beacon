@@ -3,16 +3,17 @@
 #include <SoftwareSerial.h>
 #include <TinyGPS++.h>
 
-#define APN "internet"
 #define ARDUINO_RESET_PIN 7
-#define SIM800_RESET_PIN 8
+#define GSM_RESET_PIN 8
 
 SoftwareSerial _gps_serial(11, 12); // RX, TX
 SoftwareSerial _gsm_serial(9, 10); // RX, TX
-TinyGPSPlus _gps;
 
-uint32_t _last_upload, _last_sms_check;
-char _gsm_serial_buffer[256];
+TinyGPSPlus _gps;
+TinyGPSCustom _gps_fix(_gps, "GPGSA", 2);
+
+uint32_t _last_upload;
+uint32_t _last_sms_check;
 uint8_t _failure_count;
 
 uint16_t _device_id;
@@ -23,6 +24,8 @@ uint16_t EEMEM _interval_E;
 
 char _apn[25];
 char EEMEM _apn_E[25];
+
+char _gsm_serial_buffer[256];
 
 char _lat[12];
 char _lng[12];
@@ -38,98 +41,58 @@ uint8_t _time_second;
 uint32_t _satellites;
 uint32_t _hdop;
 uint32_t _age;
+uint32_t _fix;
 
-void gps_update_values();
+const char _format_post[] PROGMEM = "id=%u&fix=%lu&lat=%s&lng=%s&alt=%s&speed=%s&course=%s&date=%02u%02u%04u&time=%02u%02u%02u&sat=%lu&hdop=%lu&age=%lu&charge=%u&voltage=%u&signal=%d";
+const char _format_sms[] PROGMEM = "#%u %luD Fix %02u/%02u/%04u %02u:%02u:%02u maps.google.com/maps?q=loc:%s,%s alt=%s sat=%lu hdop=%lu age=%lu chg=%u vtg=%u sig=%d";
+
+void gsm_reset();
 uint8_t gsm_init();
-uint8_t gsm_setup();
-uint8_t gsm_send_sms(const char* destination, const char* text);
-void gsm_process_sms(uint16_t id, const char* sender, const char* text);
 void gsm_check_sms();
+void gsm_process_sms(uint16_t id, const char* sender, const char* text);
+uint8_t gsm_send_sms(const char* destination, const char* text);
 int8_t gsm_get_signal_quality();
 void gsm_get_battery_level(uint8_t* percentage, uint16_t* voltage);
 uint8_t gsm_send_post_request(const char* url, const char* params);
 void gsm_purge_serial_buffer();
-uint8_t gsm_send_command(const char* cmd, uint16_t timeout = 5000, const char* expected = 0);
-uint8_t gsm_send_command_P(const __FlashStringHelper* cmd, uint16_t timeout = 5000, const char* expected = 0);
+uint8_t gsm_send_command(const char* command, uint16_t timeout = 2000, const char* expected = 0);
+uint8_t gsm_send_command_P(const __FlashStringHelper* command, uint16_t timeout = 2000, const char* expected = 0);
 void reboot();
 
-const char _format_0[] PROGMEM = "id=%u&lat=%s&lng=%s&alt=%s&speed=%s&course=%s&date=%02u%02u%04u&time=%02u%02u%02u&sat=%lu&hdop=%lu&age=%lu&charge=%u&voltage=%u&signal=%d";
-const char _format_1[] PROGMEM = "id=%u&charge=%u&voltage=%u&signal=%u";
-const char _format_2[] PROGMEM = "#%u %02u/%02u/%04u %02u:%02u:%02u maps.google.com/maps?q=loc:%s,%s alt=%s sat=%lu hdop=%lu age=%lu chg=%u vtg=%u sig=%d";
+void gps_init_values();
+void gps_update_values();
 
-void gps_update_values() {
-  if (_gps.location.isUpdated()) {
-    _age = _gps.location.age();
-    dtostrf(_gps.location.lat(), 4, 6, _lat);
-    dtostrf(_gps.location.lng(), 4, 6, _lng);
-  }
-
-  if (_gps.date.isUpdated()) {
-    _date_day = _gps.date.day();
-    _date_month = _gps.date.month();
-    _date_year = _gps.date.year();
-  }
-
-  if (_gps.time.isUpdated()) {
-    _time_hour = _gps.time.hour();
-    _time_minute = _gps.time.minute();
-    _time_second = _gps.time.second();
-  }
-
-  if (_gps.speed.isUpdated()) {
-    dtostrf(_gps.speed.kmph(), 4, 2, _speed);
-  }
-
-  if (_gps.course.isUpdated()) {
-    dtostrf(_gps.course.deg(), 4, 2, _course);
-  }
-
-  if (_gps.altitude.isUpdated()) {
-    dtostrf(_gps.altitude.meters(), 4, 2, _altitude);
-  }
-
-  if (_gps.satellites.isUpdated()) {
-    _satellites = _gps.satellites.value();
-  }
-
-  if (_gps.hdop.isUpdated()) {
-    _hdop = _gps.hdop.value();
-  }
+void gsm_reset() {
+  pinMode(GSM_RESET_PIN, OUTPUT);
+  digitalWrite(GSM_RESET_PIN, HIGH);
+  delay(1000);
+  digitalWrite(GSM_RESET_PIN, LOW);
+  delay(1000);
+  digitalWrite(GSM_RESET_PIN, HIGH);
+  delay(1000);
 }
 
 uint8_t gsm_init() {
-  pinMode(SIM800_RESET_PIN, OUTPUT);
-  digitalWrite(SIM800_RESET_PIN, HIGH);
-  delay(1000);
-  digitalWrite(SIM800_RESET_PIN, LOW);
-  delay(1000);
-  digitalWrite(SIM800_RESET_PIN, HIGH);
-  delay(3000);
-
-  if (!gsm_send_command_P(F("AT"))) {
+  if (gsm_send_command_P(F("AT"))) {
     return 1;
   }
 
-  if (!gsm_send_command_P(F("AT+IPR=9600"))) {
+  if (gsm_send_command_P(F("AT+IPR=9600"))) {
     return 2;
   }
 
-  if (!gsm_send_command_P(F("ATE0"))) {
+  if (gsm_send_command_P(F("ATE0"))) {
     return 3;
   }
 
-  if (!gsm_send_command_P(F("AT+CFUN=1"))) {
+  if (gsm_send_command_P(F("AT+CFUN=1"))) {
     return 4;
   }
 
-  return 0;
-}
-
-uint8_t gsm_setup() {
   bool success = false;
 
   for (uint8_t n = 0; n < 30; n++) {
-    if (gsm_send_command_P(F("AT+CREG?"))) {
+    if (gsm_send_command_P(F("AT+CREG?")) == 0) {
       char *p = strstr(_gsm_serial_buffer, "0,");
 
       if (p) {
@@ -146,29 +109,23 @@ uint8_t gsm_setup() {
   }
 
   if (!success) {
-    return 1;
+    return 5;
   }
 
-  if (!gsm_send_command_P(F("AT+CMGF=1"))) {
-    return 2;
+  if (gsm_send_command_P(F("AT+CMGF=1"))) {
+    return 6;
   }
 
-  if (!gsm_send_command_P(F("AT+CPMS=\"SM\",\"SM\",\"SM\""))) {
-    return 3;
+  if (gsm_send_command_P(F("AT+CPMS=\"SM\",\"SM\",\"SM\""))) {
+    return 7;
   }
-
-  gsm_check_sms();
 
   eeprom_read_block((void*)&_apn, (const void*)&_apn_E, sizeof(_apn) - 1);
   Serial.print(F("Using APN: "));
   Serial.println(_apn);
 
-  if (!gsm_send_command_P(F("AT+CGATT?"))) {
-    return 4;
-  }
-
-  if (!gsm_send_command_P(F("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\""))) {
-    return 5;
+  if (gsm_send_command_P(F("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\""))) {
+    return 8;
   }
 
   _gsm_serial.listen();
@@ -176,34 +133,64 @@ uint8_t gsm_setup() {
   _gsm_serial.print(_apn);
   _gsm_serial.println(F("\""));
 
-  if (!gsm_send_command(0)) {
-    return 6;
+  if (gsm_send_command(0)) {
+    return 9;
   }
 
-  if (!gsm_send_command_P(F("ATS0=1"))) {
-    return 7;
+  if (gsm_send_command_P(F("ATS0=1"))) {
+    return 10;
   }
 
   return 0;
 }
 
-uint8_t gsm_send_sms(const char* destination, const char* text) {
-  _gsm_serial.listen();
-  _gsm_serial.print(F("AT+CMGS=\""));
-  _gsm_serial.print(destination);
-  _gsm_serial.println(F("\""));
+void gsm_check_sms() {
+  gsm_send_command_P(F("AT+CMGL=\"ALL\""));
+  
+  char* p = strstr(_gsm_serial_buffer, "CMGL: ");
 
-  if (!gsm_send_command(0, 2000, ">")) {
-    return 1;
-  }
+  while (p) {
+    p += 6;
 
-  _gsm_serial.print(text);
-  _gsm_serial.write(0x1A);
-  _gsm_serial.write(0x0D);
-  _gsm_serial.write(0x0A);
+    uint8_t i;
+    char index[3];
+    char sender[20];
+    char text[161];
 
-  if (!gsm_send_command(0)) {
-    return 2;
+    i = 0;
+    memset(index, 0, sizeof(index));
+
+    while (*p != ',') {
+      index[i++] = *p++;
+      if (i >= sizeof(index)) break;
+    }
+
+    while (*p != '"') ++p; ++p;
+    while (*p != '"') ++p; ++p;
+    while (*p != '"') ++p; ++p;
+
+    i = 0;
+    memset(sender, 0, sizeof(sender));
+
+    while (*p != '"') {
+      sender[i++] = *p++;
+      if (i >= sizeof(sender)) break;
+    }
+
+    while (*p != '\n') ++p; ++p;
+
+    i = 0;
+    memset(text, 0, sizeof(text));
+
+    while (*p != '\r') {
+      text[i++] = *p++;
+      if (i >= sizeof(text)) break;
+    }
+
+    uint16_t id = atoi(index);
+    gsm_process_sms(id, sender, text);
+
+    p = strstr(p, "CMGL: ");
   }
 }
 
@@ -307,7 +294,7 @@ void gsm_process_sms(uint16_t id, const char* sender, char* text) {
     int8_t signal_strength = gsm_get_signal_quality();
     
     char reply[161];
-    sprintf_P(reply, _format_2, _device_id, _date_day, _date_month, _date_year, _time_hour, _time_minute, _time_second, _lat, _lng, _altitude, _satellites, _hdop, _age, battery_percentage, battery_voltage, signal_strength);
+    sprintf_P(reply, _format_sms, _fix, _device_id, _date_day, _date_month, _date_year, _time_hour, _time_minute, _time_second, _lat, _lng, _altitude, _satellites, _hdop, _age, battery_percentage, battery_voltage, signal_strength);
     gsm_send_sms(sender, reply);
 
     Serial.print(F("Location query: "));
@@ -315,54 +302,86 @@ void gsm_process_sms(uint16_t id, const char* sender, char* text) {
   }
 }
 
-void gsm_check_sms() {
-  gsm_send_command_P(F("AT+CMGL=\"ALL\""));
+uint8_t gsm_send_sms(const char* destination, const char* text) {
+  _gsm_serial.listen();
+  _gsm_serial.print(F("AT+CMGS=\""));
+  _gsm_serial.print(destination);
+  _gsm_serial.println(F("\""));
 
-  char* p = strstr(_gsm_serial_buffer, "CMGL: ");
+  if (!gsm_send_command(0, 2000, ">")) {
+    return 1;
+  }
 
-  while (p) {
-    p += 6;
+  _gsm_serial.print(text);
+  _gsm_serial.write(0x1A);
+  _gsm_serial.write(0x0D);
+  _gsm_serial.write(0x0A);
 
-    uint8_t i;
-    char index[3];
-    char sender[20];
-    char text[161];
+  if (!gsm_send_command(0)) {
+    return 2;
+  }
+}
 
-    i = 0;
-    memset(index, 0, sizeof(index));
+void gps_init_values() {
+  dtostrf(0, 4, 6, _lat);
+  dtostrf(0, 4, 6, _lng);
+  dtostrf(0, 4, 2, _speed);
+  dtostrf(0, 4, 2, _course);
+  dtostrf(0, 4, 2, _altitude);
+  _date_day = 0;
+  _date_month = 0;
+  _date_year = 0;
+  _time_hour = 0;
+  _time_minute = 0;
+  _time_second = 0;
+  _satellites = 0;
+  _hdop = 0;
+  _age = 0;
+  _fix = 0;
+}
 
-    while (*p != ',') {
-      index[i++] = *p++;
-      if (i >= sizeof(index)) break;
-    }
+void gps_update_values() {
+  if (_gps.location.isUpdated() && _gps.location.isValid()) {
+    _age = _gps.location.age();
+    dtostrf(_gps.location.lat(), 4, 6, _lat);
+    dtostrf(_gps.location.lng(), 4, 6, _lng);
+  }
 
-    while (*p != '"') ++p; ++p;
-    while (*p != '"') ++p; ++p;
-    while (*p != '"') ++p; ++p;
+  if (_gps.date.isUpdated() && _gps.date.isValid()) {
+    _date_day = _gps.date.day();
+    _date_month = _gps.date.month();
+    _date_year = _gps.date.year();
+  }
 
-    i = 0;
-    memset(sender, 0, sizeof(sender));
+  if (_gps.time.isUpdated() && _gps.time.isValid()) {
+    _time_hour = _gps.time.hour();
+    _time_minute = _gps.time.minute();
+    _time_second = _gps.time.second();
+  }
 
-    while (*p != '"') {
-      sender[i++] = *p++;
-      if (i >= sizeof(sender)) break;
-    }
+  if (_gps.speed.isUpdated() && _gps.speed.isValid()) {
+    dtostrf(_gps.speed.kmph(), 4, 2, _speed);
+  }
 
-    while (*p != '\n') ++p; ++p;
+  if (_gps.course.isUpdated() && _gps.course.isValid()) {
+    dtostrf(_gps.course.deg(), 4, 2, _course);
+  }
 
-    i = 0;
-    memset(text, 0, sizeof(text));
+  if (_gps.altitude.isUpdated() && _gps.altitude.isValid()) {
+    dtostrf(_gps.altitude.meters(), 4, 2, _altitude);
+  }
 
-    while (*p != '\r') {
-      text[i++] = *p++;
-      if (i >= sizeof(text)) break;
-    }
+  if (_gps.satellites.isUpdated() && _gps.satellites.isValid()) {
+    _satellites = _gps.satellites.value();
+  }
 
-    uint16_t id = atoi(index);
-    gsm_process_sms(id, sender, text);
+  if (_gps.hdop.isUpdated() && _gps.hdop.isValid()) {
+    _hdop = _gps.hdop.value();
+  }
 
-    p = strstr(p, "CMGL: ");
-  };
+  if (_gps_fix.isUpdated() && _gps_fix.isValid()) {
+    _fix = atoi(_gps_fix.value());
+  }
 }
 
 int8_t gsm_get_signal_quality() {
@@ -420,19 +439,19 @@ void gsm_get_battery_level(uint8_t* percentage, uint16_t* voltage) {
 }
 
 uint8_t gsm_send_post_request(const char* url, const char* params) {
-  if (!gsm_send_command_P(F("AT+SAPBR=1,1"), 10000)) {
+  if (gsm_send_command_P(F("AT+SAPBR=1,1"), 10000)) {
     return 1;
   }
 
-  if (!gsm_send_command_P(F("AT+SAPBR=2,1"))) {
+  if (gsm_send_command_P(F("AT+SAPBR=2,1"))) {
     return 2;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPINIT"))) {
+  if (gsm_send_command_P(F("AT+HTTPINIT"))) {
     return 3;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPPARA=\"CID\",1"))) {
+  if (gsm_send_command_P(F("AT+HTTPPARA=\"CID\",1"))) {
     return 4;
   }
 
@@ -441,19 +460,19 @@ uint8_t gsm_send_post_request(const char* url, const char* params) {
   _gsm_serial.print(url);
   _gsm_serial.println(F("\""));
 
-  if (!gsm_send_command(0)) {
+  if (gsm_send_command(0)) {
     return 5;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPPARA=\"UA\",\"bekti-tracker\""))) {
+  if (gsm_send_command_P(F("AT+HTTPPARA=\"UA\",\"bekti-tracker\""))) {
     return 6;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\""))) {
+  if (gsm_send_command_P(F("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\""))) {
     return 7;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPPARA=\"TIMEOUT\",30"))) {
+  if (gsm_send_command_P(F("AT+HTTPPARA=\"TIMEOUT\",30"))) {
     return 8;
   }
 
@@ -461,26 +480,26 @@ uint8_t gsm_send_post_request(const char* url, const char* params) {
   uint16_t params_length = strlen(params);
   sprintf(params_buffer, "AT+HTTPDATA=%d,10000", params_length);
 
-  if (!gsm_send_command(params_buffer, 5000, "DOWNLOAD")) {
+  if (gsm_send_command(params_buffer, 5000, "DOWNLOAD")) {
     return 9;
   }
 
   _gsm_serial.listen();
   _gsm_serial.print(params);
 
-  if (!gsm_send_command(0)) {
+  if (gsm_send_command(0)) {
     return 10;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPACTION=1"), 45000, "+HTTPACTION:")) {
+  if (gsm_send_command_P(F("AT+HTTPACTION=1"), 45000, "+HTTPACTION:")) {
     return 11;
   }
 
-  if (!gsm_send_command_P(F("AT+HTTPTERM"))) {
+  if (gsm_send_command_P(F("AT+HTTPTERM"))) {
     return 12;
   }
 
-  if (!gsm_send_command_P(F("AT+SAPBR=0,1"))) {
+  if (gsm_send_command_P(F("AT+SAPBR=0,1"))) {
     return 13;
   }
 
@@ -493,72 +512,78 @@ void gsm_purge_serial_buffer() {
   }
 }
 
-uint8_t gsm_send_command(const char* cmd, uint16_t timeout, const char* expected) {
+uint8_t gsm_send_command(const char* command, uint16_t timeout, const char* expected) {
   _gsm_serial.listen();
 
-  if (cmd) {
+  if (command) {
     gsm_purge_serial_buffer();
-    _gsm_serial.println(cmd);
+    _gsm_serial.println(command);
   }
 
   uint32_t t = millis();
-  uint8_t n = 0;
+  uint16_t n = 0;
 
   do {
     if (_gsm_serial.available()) {
       char c = _gsm_serial.read();
-      Serial.write(c);
+      //Serial.write(c);
 
       if (n >= sizeof(_gsm_serial_buffer) - 1) {
-        // buffer full, discard first half
-        n = sizeof(_gsm_serial_buffer) / 2 - 1;
-        memcpy(_gsm_serial_buffer, _gsm_serial_buffer + sizeof(_gsm_serial_buffer) / 2, n);
+        n = sizeof(_gsm_serial_buffer) - 2;
+        memcpy(_gsm_serial_buffer, _gsm_serial_buffer  + 1, n);
       }
 
       _gsm_serial_buffer[n++] = c;
       _gsm_serial_buffer[n] = 0;
 
-      if (strstr(_gsm_serial_buffer, expected ? expected : "OK\r")) {
-        return n;
+      if (expected && strstr(_gsm_serial_buffer, expected)) {
+        return 0;
+      } else if (strstr_P(_gsm_serial_buffer, PSTR("OK\r"))) {
+        return 0;
+      } else if (strstr_P(_gsm_serial_buffer, PSTR("ERROR\r"))) {
+        return 1;
       }
     }
   } while (millis() - t < timeout);
 
-  return 0;
+  return 2;
 }
 
-uint8_t gsm_send_command_P(const __FlashStringHelper* cmd, uint16_t timeout, const char* expected) {
+uint8_t gsm_send_command_P(const __FlashStringHelper* command, uint16_t timeout, const char* expected) {
   _gsm_serial.listen();
 
-  if (cmd) {
+  if (command) {
     gsm_purge_serial_buffer();
-    _gsm_serial.println(cmd);
+    _gsm_serial.println(command);
   }
 
   uint32_t t = millis();
-  uint8_t n = 0;
+  uint16_t n = 0;
 
   do {
     if (_gsm_serial.available()) {
       char c = _gsm_serial.read();
-      Serial.write(c);
+      //Serial.write(c);
 
       if (n >= sizeof(_gsm_serial_buffer) - 1) {
-        // buffer full, discard first half
-        n = sizeof(_gsm_serial_buffer) / 2 - 1;
-        memcpy(_gsm_serial_buffer, _gsm_serial_buffer + sizeof(_gsm_serial_buffer) / 2, n);
+        n = sizeof(_gsm_serial_buffer) - 2;
+        memcpy(_gsm_serial_buffer, _gsm_serial_buffer  + 1, n);
       }
 
       _gsm_serial_buffer[n++] = c;
       _gsm_serial_buffer[n] = 0;
 
-      if (strstr(_gsm_serial_buffer, expected ? expected : "OK\r")) {
-        return n;
+      if (expected && strstr(_gsm_serial_buffer, expected)) {
+        return 0;
+      } else if (strstr_P(_gsm_serial_buffer, PSTR("OK\r"))) {
+        return 0;
+      } else if (strstr_P(_gsm_serial_buffer, PSTR("ERROR\r"))) {
+        return 1;
       }
     }
   } while (millis() - t < timeout);
 
-  return 0;
+  return 2;
 }
 
 void reboot() {
@@ -568,6 +593,10 @@ void reboot() {
 void setup() {
   digitalWrite(ARDUINO_RESET_PIN, HIGH);
   pinMode(ARDUINO_RESET_PIN, OUTPUT);
+  
+  Serial.begin(9600);
+  _gps_serial.begin(9600);
+  _gsm_serial.begin(9600);
 
   Serial.println(F("Bekti Tracker 0.1.0"));
 
@@ -579,71 +608,42 @@ void setup() {
   Serial.print(F("Update interval: "));
   Serial.println(_interval);
 
-  Serial.begin(9600);
-  _gps_serial.begin(9600);
-  _gsm_serial.begin(9600);
-
   for (;;) {
-    Serial.println(F("Initializing GSM... "));
-    uint8_t ret = gsm_init();
-
-    if (ret == 0) {
-      Serial.println(F("OK"));
-      break;
-    }
-
-    Serial.print(F("Error code: "));
-    Serial.println(ret);
+    gsm_reset();
+    uint8_t result = gsm_init();
+    if (result == 0) break;
   }
 
-  for (;;) {
-    Serial.println(F("Setting up network... "));
-    uint8_t ret = gsm_setup();
-
-    if (ret == 0) {
-      Serial.println(F("OK"));
-      break;
-    }
-
-    Serial.print(F("Error code: "));
-    Serial.println(ret);
-  }
+  gps_init_values();
 }
 
 void loop() {
   _gps_serial.listen();
 
   while (_gps_serial.available()) {
-    _gps.encode(_gps_serial.read());
+    char c = _gps_serial.read();
+    _gps.encode(c);
     gps_update_values();
   }
 
   if (millis() - _last_sms_check > 5000) {
-    Serial.print(F("Check SMS"));
+    Serial.println(F("Check SMS"));
     gsm_check_sms();
     _last_sms_check = millis();
   }
 
   if (millis() - _last_upload > _interval) {
-    Serial.print(F("Interval "));
-    Serial.println(_interval);
-
-    gsm_check_sms();
-
-    uint8_t battery_percentage;
-    uint16_t battery_voltage;
-    gsm_get_battery_level(&battery_percentage, &battery_voltage);
-    int8_t signal_strength = gsm_get_signal_quality();
+    uint8_t battery_percentage = 78;
+    uint16_t battery_voltage = 4700;
+    int8_t signal_strength = 20;
+  
     char params_buffer[200];
-    if (_gps.location.isValid()) {
-      sprintf_P(params_buffer, _format_0, _device_id, _lat, _lng, _altitude, _speed, _course, _date_day, _date_month, _date_year, _time_hour, _time_minute, _time_second, _satellites, _hdop, _age, battery_percentage, battery_voltage, signal_strength);
-    } else {
-      sprintf_P(params_buffer, _format_1, _device_id, battery_percentage, battery_voltage, signal_strength);
-    }
+    sprintf_P(params_buffer, _format_post, _device_id, _fix, _lat, _lng, _altitude, _speed, _course, _date_day, _date_month, _date_year, _time_hour, _time_minute, _time_second, _satellites, _hdop, _age, battery_percentage, battery_voltage, signal_strength);
+    Serial.println(params_buffer);
 
-    uint8_t ret = gsm_send_post_request("seth.bekti.io/api/v1/location", params_buffer);
+    uint8_t result = gsm_send_post_request("seth.bekti.io/api/v1/location", params_buffer);
 
-    if (ret != 0) {
+    if (result != 0) {
       ++_failure_count;
     } else {
       _failure_count = 0;
